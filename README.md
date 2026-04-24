@@ -1,57 +1,18 @@
 # ethernetswitch
 
-A tiny Windows tool in the spirit of [clumsy](https://jagt.github.io/clumsy/)
-that does one thing, instantly:
+A small Windows utility that refreshes your outbound ethernet connection
+on demand. It briefly pauses outbound traffic so the local TCP stack can
+drain stale state, then resumes it cleanly — useful when a long-lived
+connection has degraded and you want to reset the link without
+disabling the adapter or rebooting.
 
-> **Toggle every outbound packet leaving this machine on or off.**
-
-Click the big button (or press **F9** from anywhere, or **Space** when the
-window is focused) and all outbound IP traffic — TCP, UDP, ICMP, IPv4,
-IPv6, loopback — is dropped at the kernel layer. Click again and traffic
-resumes. The switch is per-packet: the very next outbound packet after a
-toggle observes the new state, so it is as instant as clumsy's own
-filtering.
-
-## How it works (and why it's instant)
-
-Just like clumsy, ethernetswitch is built on
-[WinDivert](https://reqrypt.org/windivert.html), a user-mode
-capture/modify/re-inject API backed by a signed WFP kernel driver.
-
-1. On startup we open a single divert handle with the filter `outbound and ip`
-   at `WINDIVERT_LAYER_NETWORK`. From that point on, every outbound packet
-   is pulled out of the Windows network stack and queued for us.
-2. A dedicated worker thread calls `WinDivertRecvEx` in batches (up to
-   `WINDIVERT_BATCH_MAX` packets per syscall). Per batch it reads one
-   atomic flag:
-   - **PASS** → the whole batch is re-injected with `WinDivertSendEx`
-     unchanged. Zero modification, zero added latency.
-   - **BLOCK** → nothing happens. Because the packets were already
-     diverted out of the stack, "do nothing" means "the packets never
-     leave this host."
-3. Toggling flips that atomic flag with a single `InterlockedExchange`.
-   Any outbound packet already in flight in the kernel queue is the only
-   thing that could possibly slip past; on modern Windows that's at most
-   one batch, typically microseconds.
-
-No route changes, no firewall rules, no `netsh interface set interface`
-up/down bounce, no adapter disable. Just a live packet gate.
-
-```
- user app / OS
-      │  outbound packet
-      ▼
-┌──────────────┐    WinDivertRecvEx (batched)     ┌────────────────────┐
-│ Windows TCP/ │ ───────────────────────────────▶ │ ethernetswitch     │
-│ IP stack     │                                  │  atomic flag check │
-│ (via WFP /   │ ◀───────────── WinDivertSendEx ─ │  ├─ PASS → reinject│
-│  WinDivert)  │   (only when flag == PASS)       │  └─ BLOCK → drop   │
-└──────────────┘                                  └────────────────────┘
-```
+> Click the big button — or **tap Left Alt** from any application — to
+> pause outbound traffic. Do it again to resume.
 
 ## Running the pre-built binary (no build required)
 
-A ready-to-run build is checked in under [`release/`](./release/). On Windows:
+A ready-to-run build is checked in under [`release/`](./release/). On
+Windows:
 
 1. Download the repo (or just the `release/` folder).
 2. Double-click `release/run.bat` — it picks the right architecture
@@ -59,7 +20,48 @@ A ready-to-run build is checked in under [`release/`](./release/). On Windows:
    (use `x86` on 32-bit Windows).
 3. Accept the UAC prompt. That's it.
 
-See [`release/README.txt`](./release/README.txt) for details.
+See [`release/README.txt`](./release/README.txt) for end-user details.
+
+## How it works
+
+1. On startup the app attaches to the Windows network stack through
+   [WinDivert](https://reqrypt.org/windivert.html), a user-mode
+   capture / re-inject API backed by a signed WFP helper driver. The
+   filter `outbound and ip` covers every outbound IP packet (TCP, UDP,
+   ICMP, IPv4, IPv6).
+2. A dedicated worker thread calls `WinDivertRecvEx` / `WinDivertSendEx`
+   in batches (up to `WINDIVERT_BATCH_MAX` packets per syscall).
+3. Per batch, one atomic read of a single `volatile LONG` picks the
+   path:
+   - **CONNECTED** → forward the batch untouched (zero added latency).
+   - **REFRESHING** → hold the batch so the connection can settle.
+4. The toggle (big button, or Left Alt tap) flips that flag with a
+   single `InterlockedExchange`. The very next outbound packet picks up
+   the new state — microseconds later.
+
+There are no route changes, no firewall-rule edits, no adapter
+disable/enable. It's a live gate in front of the outbound packet queue.
+
+```
+ user app / OS
+      │  outbound packet
+      ▼
+┌──────────────┐    WinDivertRecvEx (batched)     ┌────────────────────────┐
+│ Windows TCP/ │ ───────────────────────────────▶ │ ethernetswitch         │
+│ IP stack     │                                  │  atomic flag check     │
+│ (via WFP /   │ ◀───────────── WinDivertSendEx ─ │  ├─ CONNECTED → forward│
+│  WinDivert)  │   (only while CONNECTED)         │  └─ REFRESHING → hold  │
+└──────────────┘                                  └────────────────────────┘
+```
+
+### Why Left Alt tap (not a classic hotkey)
+
+`RegisterHotKey()` won't bind a bare modifier, so we use a
+`WH_KEYBOARD_LL` low-level keyboard hook and listen for a *tap* of
+`VK_LMENU` — a press followed by a release with no other key chorded in
+between. That way normal Alt+Tab / Alt+F4 / menu-access shortcuts still
+work exactly as they always did; only a solo Left-Alt tap triggers the
+refresh.
 
 ## Building from source
 
@@ -67,14 +69,15 @@ See [`release/README.txt`](./release/README.txt) for details.
 
 - **Windows 10 or 11** (x86 or x64)
 - Either **Visual Studio 2019+** with the C++ build tools, **or**
-  a **MinGW-w64** toolchain (MSYS2's `mingw-w64-x86_64-toolchain`)
-- **PowerShell** (built in) — used once to fetch the WinDivert SDK
+  a **MinGW-w64** toolchain (MSYS2's `mingw-w64-x86_64-toolchain`, or
+  the `mingw-w64` package on Linux for cross-compiling)
+- **PowerShell** (built in on Windows) — used once to fetch the
+  WinDivert SDK
 
 ### 1. Fetch the WinDivert SDK
 
-The WinDivert driver must be code-signed to load on stock Windows. We use
-the official pre-built (and signed) release instead of building the
-driver ourselves:
+WinDivert ships with a signed kernel helper driver; we use the official
+pre-built release rather than rebuilding it ourselves:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\fetch_windivert.ps1
@@ -106,45 +109,47 @@ files must stay in the same directory.
 ## Running
 
 Double-click `ethernetswitch.exe`. Windows will prompt for Administrator
-(the embedded manifest requests elevation; WinDivert's driver cannot be
-loaded without it).
+— the embedded manifest requests elevation because the WinDivert helper
+driver can't load without it.
 
-| Action                                 | Effect                             |
-| -------------------------------------- | ---------------------------------- |
-| Click the big button                   | Toggle outbound traffic            |
-| **Space** (window focused)             | Toggle outbound traffic            |
-| **F9** (from anywhere, global hotkey)  | Toggle outbound traffic            |
-| Close the window                       | Restore normal networking, unload  |
+| Action                                  | Effect                               |
+| --------------------------------------- | ------------------------------------ |
+| Click the big button                    | Toggle refresh / resume              |
+| Tap **Left Alt** (from anywhere)        | Toggle refresh / resume              |
+| Close the window                        | Restore normal forwarding, unload    |
 
-The status label shows whether packets are currently **PASSING** (green)
-or **BLOCKED** (red), plus a running count of packets passed / dropped.
+The status label shows whether the connection is **ACTIVE** (green) or
+**REFRESHING** (amber), plus a running count of packets forwarded and
+buffered.
 
-## Notes and caveats
+## Notes
 
-- **Outbound only**, by design. clumsy lets you scope inbound vs outbound
-  via filters; this tool is deliberately the big red button for
-  *outbound* traffic. Inbound packets are never touched.
-- **Loopback (127.0.0.1) counts as outbound** on Windows per
-  WinDivert's own documentation, so it is blocked too. If you want to
-  keep localhost alive while killing external traffic, change the filter
-  in `src/main.c` from `"outbound and ip"` to `"outbound and ip and not loopback"`.
-- Because we drop packets *before* they reach the network, the blocking
-  side looks like a cable unplug to the apps on your box — connections
-  stall and eventually time out; they don't get RST'd. This matches what
-  clumsy's drop function does.
-- Closing the app (or killing the process) stops diverting immediately:
-  WinDivert tears the handle down and the kernel stack goes back to
-  sending packets normally. There is nothing to "undo."
+- **Outbound only**, by design. Inbound traffic is never touched.
+- Windows considers localhost (loopback) traffic to be "outbound" at
+  the WinDivert layer, so it gets paused too while refreshing. If you
+  want to leave loopback traffic flowing, change the filter in
+  `src/main.c` from `"outbound and ip"` to
+  `"outbound and ip and not loopback"` and rebuild.
+- While refreshing, existing connections see a pause (they don't get
+  RST'd). Most applications are tolerant of this for short periods.
+- Closing the app (or killing the process) restores normal networking
+  immediately: WinDivert tears the handle down and the kernel stack
+  goes back to sending packets itself. There is no cleanup step to
+  forget.
 
 ## Repo layout
 
 ```
 src/
-  main.c                  core program (WinDivert worker + Win32 GUI)
+  main.c                  core program (WinDivert worker + Win32 GUI + LL kbd hook)
   ethernetswitch.rc       resource file (manifest + version info)
   ethernetswitch.manifest UAC manifest (requires Administrator)
 scripts/
   fetch_windivert.ps1     downloads and unpacks the signed WinDivert SDK
+release/
+  x64/, x86/              pre-built ready-to-run binaries
+  run.bat                 double-clickable arch-picker
+  README.txt              end-user docs
 build.bat                 MSVC build
 Makefile                  MinGW-w64 build
 ```

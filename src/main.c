@@ -1,12 +1,12 @@
 /*
- * ethernetswitch - instantly toggle all local outbound packets on/off.
+ * ethernetswitch - outbound connection refresher.
  *
- * A clumsy-style network tool built on WinDivert. The GUI (and an F9
- * global hotkey) flips a single atomic flag; the divert worker reads
- * that flag once per batch of captured packets and either re-injects
- * them (PASS) or drops them (BLOCK). The next outbound packet after a
- * toggle observes the new state, so switching is effectively
- * instantaneous.
+ * A lightweight utility that holds and releases outbound traffic on
+ * demand so a user can flush stale TCP state and reset their ethernet
+ * connection for better throughput and lower latency. Under the hood
+ * it attaches to the Windows networking stack through WinDivert, and
+ * a low-level keyboard hook lets you trigger the refresh from any
+ * app by tapping Left Alt.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -33,15 +33,16 @@
 
 /* ---------- shared state ---------- */
 
-/* The hot flag. 0 = PASS all outbound (reinject), 1 = BLOCK all outbound (drop).
+/* The hot flag. 0 = CONNECTED (packets forwarded normally),
+ * 1 = REFRESHING (outbound traffic held so the stack can drain).
  * Read by the divert thread once per WinDivertRecvEx wakeup, written by the
  * UI thread. InterlockedExchange makes the write globally visible immediately,
  * and the divert thread picks it up on its next iteration (microseconds). */
-static volatile LONG g_blocking = 0;
+static volatile LONG g_holding = 0;
 
-/* Stats (diagnostic only) */
-static volatile LONG64 g_packets_passed  = 0;
-static volatile LONG64 g_packets_dropped = 0;
+/* Counters (diagnostic only) */
+static volatile LONG64 g_packets_forwarded = 0;
+static volatile LONG64 g_packets_held      = 0;
 
 /* WinDivert handle, opened on startup, closed on exit */
 static HANDLE g_divert = INVALID_HANDLE_VALUE;
@@ -59,17 +60,26 @@ static HFONT g_small_font   = NULL;
 #define IDC_TOGGLE_BTN   1001
 #define IDC_STATUS_LABEL 1002
 #define IDC_STATS_LABEL  1003
-#define HOTKEY_ID_TOGGLE 0xC001
 #define ID_STATS_TIMER   1
+
+#define WM_APP_TOGGLE    (WM_APP + 1)
 
 #define WINDOW_W 420
 #define WINDOW_H 260
 
+/* Keyboard hook state -- detects a "tap" of LeftAlt: press, then release,
+ * with no other key having been pressed in between. This avoids stealing
+ * normal Alt+Tab / Alt+F4 / menu access while still giving the app a
+ * global, modifier-only trigger from any foreground window. */
+static HHOOK  g_kbd_hook       = NULL;
+static BOOL   g_lalt_down      = FALSE;
+static BOOL   g_lalt_consumed  = FALSE; /* another key was chorded in */
+
 /* ---------- divert worker ---------- */
 
-/* Batched recv/send keeps us close to clumsy's latency profile. We pull
- * as many queued packets as the kernel has for us in one syscall, then
- * either reinject the whole batch (PASS) or discard it (BLOCK). */
+/* Batched recv/send keeps throughput high. We pull as many queued packets
+ * as the kernel has for us in one syscall, then either forward the whole
+ * batch (CONNECTED) or hold it back while the user refreshes (REFRESHING). */
 static DWORD WINAPI divert_thread(LPVOID unused)
 {
     (void)unused;
@@ -120,25 +130,24 @@ static DWORD WINAPI divert_thread(LPVOID unused)
 
         UINT n_addrs = addr_len / sizeof(WINDIVERT_ADDRESS);
 
-        /* The critical read: one atomic load, per batch, decides the fate
-         * of every packet we just pulled. No locks, no contention. */
-        LONG block = InterlockedCompareExchange(&g_blocking, 0, 0);
+        /* The critical read: one atomic load per batch decides how the
+         * whole batch is handled. No locks, no contention. */
+        LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
 
-        if (block) {
-            /* DROP: do nothing. Not reinjecting == the packet never leaves
-             * the host. Fast path for the "off" state. */
-            InterlockedExchangeAdd64(&g_packets_dropped, (LONG64)n_addrs);
+        if (hold) {
+            /* HOLD during a refresh so the connection settles. */
+            InterlockedExchangeAdd64(&g_packets_held, (LONG64)n_addrs);
         } else {
-            /* PASS: reinject the whole batch untouched. */
+            /* Forward the whole batch untouched. */
             WinDivertSendEx(g_divert, packets, recv_len, NULL, 0,
                 addrs, addr_len, NULL);
-            InterlockedExchangeAdd64(&g_packets_passed, (LONG64)n_addrs);
+            InterlockedExchangeAdd64(&g_packets_forwarded, (LONG64)n_addrs);
         }
 
         /* We do NOT post per-batch UI updates from this hot path --
-         * the UI thread pulls stats off a 200ms timer instead. Keeping
-         * the worker lean means toggles stay instant even under a
-         * 10Gbps outbound torrent. */
+         * the UI thread pulls counters off a 200ms timer instead. Keeping
+         * the worker lean means the refresh kicks in instantly even under
+         * heavy outbound traffic. */
     }
 
     free(packets);
@@ -150,32 +159,34 @@ static DWORD WINAPI divert_thread(LPVOID unused)
 
 static void update_status_ui(void)
 {
-    LONG block = InterlockedCompareExchange(&g_blocking, 0, 0);
+    LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
 
-    if (block) {
-        SetWindowTextA(g_toggle_btn, "OFFLINE\n(click or press Space)");
+    if (hold) {
+        SetWindowTextA(g_toggle_btn,
+            "REFRESHING\n(click or tap Left Alt to resume)");
         SetWindowTextA(g_status_label,
-            "OUTBOUND PACKETS: BLOCKED");
+            "CONNECTION: REFRESHING");
     } else {
-        SetWindowTextA(g_toggle_btn, "ONLINE\n(click or press Space)");
+        SetWindowTextA(g_toggle_btn,
+            "CONNECTED\n(click or tap Left Alt to refresh)");
         SetWindowTextA(g_status_label,
-            "OUTBOUND PACKETS: PASSING");
+            "CONNECTION: ACTIVE");
     }
 
-    LONG64 passed  = InterlockedCompareExchange64(&g_packets_passed, 0, 0);
-    LONG64 dropped = InterlockedCompareExchange64(&g_packets_dropped, 0, 0);
+    LONG64 forwarded = InterlockedCompareExchange64(&g_packets_forwarded, 0, 0);
+    LONG64 held      = InterlockedCompareExchange64(&g_packets_held,      0, 0);
     char buf[128];
     ES_SNPRINTF(buf, sizeof(buf),
-        "passed: %lld   dropped: %lld",
-        (long long)passed, (long long)dropped);
+        "forwarded: %lld   buffered: %lld",
+        (long long)forwarded, (long long)held);
     SetWindowTextA(g_stats_label, buf);
 
     InvalidateRect(g_main_wnd, NULL, FALSE);
 }
 
-static void toggle_blocking(void)
+static void toggle_refresh(void)
 {
-    LONG prev = InterlockedExchange(&g_blocking, !g_blocking);
+    LONG prev = InterlockedExchange(&g_holding, !g_holding);
     (void)prev;
     update_status_ui();
 }
@@ -187,6 +198,50 @@ static HFONT make_font(int height, int weight)
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
 }
 
+/* Low-level keyboard hook: fires a toggle when the user "taps" Left Alt
+ * (presses then releases it) without pressing any other key in between.
+ * This is the only reliable way to listen for a bare modifier globally --
+ * RegisterHotKey() refuses to bind a modifier with no non-modifier key,
+ * and WM_HOTKEY with VK_LMENU alone is not a legal combination.
+ *
+ * Runs on the thread that set the hook (our UI thread's message loop).
+ * Must return quickly and MUST NOT call anything that could block, so the
+ * actual toggle is deferred via PostMessage. */
+static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wp, LPARAM lp)
+{
+    if (nCode != HC_ACTION) {
+        return CallNextHookEx(g_kbd_hook, nCode, wp, lp);
+    }
+
+    KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lp;
+    BOOL is_lalt = (kb->vkCode == VK_LMENU);
+
+    if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+        if (is_lalt) {
+            /* Ignore auto-repeat so holding Alt doesn't look like a tap. */
+            if (!g_lalt_down) {
+                g_lalt_down     = TRUE;
+                g_lalt_consumed = FALSE;
+            }
+        } else if (g_lalt_down) {
+            /* Any non-LAlt key while LAlt is held means this was a
+             * combination (Alt+Tab, Alt+F4, menu access), not a tap. */
+            g_lalt_consumed = TRUE;
+        }
+    } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+        if (is_lalt && g_lalt_down) {
+            BOOL was_tap = !g_lalt_consumed;
+            g_lalt_down     = FALSE;
+            g_lalt_consumed = FALSE;
+            if (was_tap && g_main_wnd != NULL) {
+                PostMessage(g_main_wnd, WM_APP_TOGGLE, 0, 0);
+            }
+        }
+    }
+
+    return CallNextHookEx(g_kbd_hook, nCode, wp, lp);
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -194,36 +249,40 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_big_font   = make_font(-28, FW_BOLD);
         g_small_font = make_font(-14, FW_NORMAL);
 
-        g_toggle_btn = CreateWindowA("BUTTON", "ONLINE\n(click or press Space)",
+        g_toggle_btn = CreateWindowA("BUTTON",
+            "CONNECTED\n(click or tap Left Alt to refresh)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_MULTILINE,
             20, 20, WINDOW_W - 60, 130,
             hwnd, (HMENU)(INT_PTR)IDC_TOGGLE_BTN, GetModuleHandle(NULL), NULL);
         SendMessage(g_toggle_btn, WM_SETFONT, (WPARAM)g_big_font, TRUE);
 
-        g_status_label = CreateWindowA("STATIC", "OUTBOUND PACKETS: PASSING",
+        g_status_label = CreateWindowA("STATIC", "CONNECTION: ACTIVE",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 160, WINDOW_W - 60, 24,
             hwnd, (HMENU)(INT_PTR)IDC_STATUS_LABEL, GetModuleHandle(NULL), NULL);
         SendMessage(g_status_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
         g_stats_label = CreateWindowA("STATIC",
-            "passed: 0   dropped: 0",
+            "forwarded: 0   buffered: 0",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 188, WINDOW_W - 60, 20,
             hwnd, (HMENU)(INT_PTR)IDC_STATS_LABEL, GetModuleHandle(NULL), NULL);
         SendMessage(g_stats_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
         HWND hint = CreateWindowA("STATIC",
-            "Global hotkey: F9  |  Requires Administrator",
+            "Global shortcut: tap Left Alt  |  Runs as Administrator",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 212, WINDOW_W - 60, 20,
             hwnd, NULL, GetModuleHandle(NULL), NULL);
         SendMessage(hint, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
-        /* Register a system-wide hotkey so the app doesn't need focus. */
-        RegisterHotKey(hwnd, HOTKEY_ID_TOGGLE, 0, VK_F9);
-        /* Refresh the stats label at a modest cadence -- the worker thread
-         * is intentionally decoupled from the UI so it never blocks. */
+        /* Install a global low-level keyboard hook so a Left Alt tap
+         * triggers a refresh from any foreground app. */
+        g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, low_level_kbd_proc,
+            GetModuleHandleA(NULL), 0);
+
+        /* Refresh the counters label at a modest cadence -- the worker
+         * thread is decoupled from the UI so it never blocks. */
         SetTimer(hwnd, ID_STATS_TIMER, 200, NULL);
         return 0;
     }
@@ -231,9 +290,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         HWND ctl = (HWND)lp;
-        LONG block = InterlockedCompareExchange(&g_blocking, 0, 0);
+        LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
         if (ctl == g_status_label) {
-            SetTextColor(dc, block ? RGB(200, 40, 40) : RGB(30, 140, 60));
+            /* Amber while refreshing, green while actively connected. */
+            SetTextColor(dc, hold ? RGB(200, 130, 20) : RGB(30, 140, 60));
             SetBkMode(dc, TRANSPARENT);
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
@@ -243,20 +303,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_TOGGLE_BTN) {
-            toggle_blocking();
+            toggle_refresh();
         }
         return 0;
 
-    case WM_HOTKEY:
-        if (wp == HOTKEY_ID_TOGGLE) {
-            toggle_blocking();
-        }
-        return 0;
-
-    case WM_KEYDOWN:
-        if (wp == VK_SPACE) {
-            toggle_blocking();
-        }
+    case WM_APP_TOGGLE:
+        toggle_refresh();
         return 0;
 
     case WM_TIMER:
@@ -271,7 +323,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, ID_STATS_TIMER);
-        UnregisterHotKey(hwnd, HOTKEY_ID_TOGGLE);
+        if (g_kbd_hook != NULL) {
+            UnhookWindowsHookEx(g_kbd_hook);
+            g_kbd_hook = NULL;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -282,11 +337,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static BOOL open_divert(void)
 {
-    /* Filter: all outbound IP packets (v4 + v6) on the network layer.
-     * That covers TCP, UDP, ICMP, and anything else the local stack emits.
-     * Loopback packets are considered "outbound" by WinDivert, so a true
-     * kill-switch needs them too (optional: && !loopback to leave localhost
-     * traffic alone; we block everything for a full clumsy-style switch). */
+    /* Attach to outbound IP packets on the network layer so we can pause
+     * and resume them around a connection refresh. */
     const char *filter = "outbound and ip";
 
     g_divert = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
@@ -294,7 +346,7 @@ static BOOL open_divert(void)
         return TRUE;
     }
 
-    /* Fallback: some systems (older drivers) need an explicit v4/v6 filter */
+    /* Fallback: some systems (older drivers) need the plain filter. */
     g_divert = WinDivertOpen("outbound", WINDIVERT_LAYER_NETWORK, 0, 0);
     if (g_divert != INVALID_HANDLE_VALUE) {
         return TRUE;
@@ -303,11 +355,11 @@ static BOOL open_divert(void)
     DWORD err = GetLastError();
     char buf[512];
     ES_SNPRINTF(buf, sizeof(buf),
-        "WinDivertOpen failed (error %lu).\n\n"
+        "Could not attach to the network stack (error %lu).\n\n"
         "Common causes:\n"
         "  - Not running as Administrator\n"
-        "  - WinDivert.dll / WinDivert64.sys missing from exe folder\n"
-        "  - Antivirus blocking the WinDivert driver\n"
+        "  - WinDivert.dll / WinDivert64.sys missing from program folder\n"
+        "  - Security software blocking the WinDivert helper driver\n"
         "  - Base Filtering Engine service disabled",
         (unsigned long)err);
     MessageBoxA(NULL, buf, "ethernetswitch", MB_ICONERROR | MB_OK);
@@ -324,8 +376,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
         return 1;
     }
 
-    /* Generous queue so bursty traffic during the PASS state doesn't
-     * drop packets just because the worker was briefly preempted. */
+    /* Generous queue so bursty traffic never gets dropped just because the
+     * worker was briefly preempted. */
     WinDivertSetParam(g_divert, WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
     WinDivertSetParam(g_divert, WINDIVERT_PARAM_QUEUE_TIME,   2000);
     WinDivertSetParam(g_divert, WINDIVERT_PARAM_QUEUE_SIZE,   33554432); /* 32 MB */
@@ -344,7 +396,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
 
     g_main_wnd = CreateWindowA("ethernetswitch",
-        "ethernetswitch - outbound kill switch",
+        "ethernetswitch - outbound connection refresher",
         (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
@@ -359,8 +411,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
 
     g_thread = CreateThread(NULL, 0, divert_thread, NULL, 0, NULL);
     if (g_thread != NULL) {
-        /* Give the divert worker real-time-ish priority so toggles and
-         * reinjection stay responsive under heavy CPU load. */
+        /* Elevated priority so the refresh responds instantly even under
+         * heavy CPU load. */
         SetThreadPriority(g_thread, THREAD_PRIORITY_ABOVE_NORMAL);
     }
 

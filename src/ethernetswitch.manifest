@@ -4,7 +4,7 @@
                     processorArchitecture="*"
                     name="ethernetswitch"
                     type="win32"/>
-  <description>Instantly toggle all local outbound packets on/off</description>
+  <description>Refresh the local outbound ethernet connection for better performance</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

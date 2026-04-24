@@ -1,7 +1,9 @@
 ethernetswitch - ready-to-run build
 ===================================
 
-This folder contains pre-built, ready-to-run binaries. Just start the program.
+Outbound connection refresher for Windows. Pauses and releases outbound
+ethernet traffic on demand so stale TCP state can drain and the
+connection comes back cleaner.
 
 How to run
 ----------
@@ -9,7 +11,9 @@ How to run
 On 64-bit Windows (almost everything today):
   1. Open the  x64\  folder.
   2. Double-click  ethernetswitch.exe
-  3. Click "Yes" on the UAC prompt (WinDivert's kernel driver needs Admin).
+  3. Click "Yes" on the UAC prompt (the WinDivert helper driver that
+     ethernetswitch uses to attach to the network stack requires
+     Administrator access).
 
 On 32-bit Windows:
   1. Open the  x86\  folder.
@@ -18,28 +22,28 @@ On 32-bit Windows:
 Not sure which? Right-click "This PC" -> Properties -> System type.
 If it says "64-bit operating system", use  x64\ .
 
-Using the switch
-----------------
+Using the refresher
+-------------------
 
-  - Click the big button -------> toggle outbound traffic on/off
-  - Press SPACE (window focused)-> toggle outbound traffic on/off
-  - Press F9 from ANY app ------> toggle outbound traffic on/off (global hotkey)
-  - Close the window -----------> network returns to normal immediately
+  - Click the big button -----------> start / stop a refresh
+  - Tap LEFT ALT from any app ------> start / stop a refresh (global)
 
-When "OFFLINE", every outbound packet (TCP, UDP, ICMP, IPv4, IPv6, loopback)
-is dropped by the kernel before it reaches the wire. Existing connections
-will stall and time out; new ones can't even send a SYN.
+The global shortcut is a *tap* of Left Alt (press and release with no
+other key in between), so normal Alt+Tab, Alt+F4, and menu shortcuts
+keep working.
 
-When "ONLINE", packets pass through untouched with effectively zero added
-latency -- the same approach clumsy uses.
+While "REFRESHING", outbound traffic is paused so the network stack can
+settle. Tap Left Alt (or click the button) again to resume -- traffic
+is forwarded again immediately. Closing the window always returns the
+connection to normal.
 
 What's in each folder
 ---------------------
 
   ethernetswitch.exe   the app itself
   WinDivert.dll        user-mode library (must sit next to the .exe)
-  WinDivert64.sys      signed kernel driver  (x64 build)
-  WinDivert32.sys      signed kernel driver  (x86 build)
+  WinDivert64.sys      signed helper driver  (x64 build)
+  WinDivert32.sys      signed helper driver  (x86 build)
 
 The WinDivert files are the official signed release from
 https://github.com/basil00/WinDivert (LGPL-3.0). They must stay next to
@@ -48,7 +52,7 @@ ethernetswitch.exe -- do not separate them.
 Uninstall
 ---------
 
-Delete the folder. If you want to also remove the kernel driver service
+Delete the folder. If you want to also remove the helper driver service
 that WinDivert silently installs on first use, open an Administrator
 command prompt and run:
 

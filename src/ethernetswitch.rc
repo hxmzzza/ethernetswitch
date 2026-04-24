@@ -3,8 +3,8 @@
 1 24 "ethernetswitch.manifest"
 
 1 VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,0
+PRODUCTVERSION  1,1,0,0
 FILEOS          0x00040004L
 FILETYPE        0x00000001L
 FILESUBTYPE     0x00000000L
@@ -14,12 +14,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName",      "ethernetswitch"
-            VALUE "FileDescription",  "Instant outbound packet toggle"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileDescription",  "Outbound connection refresher"
+            VALUE "FileVersion",      "1.1.0.0"
             VALUE "InternalName",     "ethernetswitch"
             VALUE "OriginalFilename", "ethernetswitch.exe"
             VALUE "ProductName",      "ethernetswitch"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion",   "1.1.0.0"
         END
     END
     BLOCK "VarFileInfo"
