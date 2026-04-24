@@ -40,10 +40,6 @@
  * and the divert thread picks it up on its next iteration (microseconds). */
 static volatile LONG g_holding = 0;
 
-/* Counters (diagnostic only) */
-static volatile LONG64 g_packets_forwarded = 0;
-static volatile LONG64 g_packets_held      = 0;
-
 /* WinDivert handle, opened on startup, closed on exit */
 static HANDLE g_divert = INVALID_HANDLE_VALUE;
 static HANDLE g_thread = NULL;
@@ -53,19 +49,19 @@ static volatile LONG g_should_exit = 0;
 static HWND g_main_wnd      = NULL;
 static HWND g_toggle_btn    = NULL;
 static HWND g_status_label  = NULL;
-static HWND g_stats_label   = NULL;
 static HFONT g_big_font     = NULL;
 static HFONT g_small_font   = NULL;
 
 #define IDC_TOGGLE_BTN   1001
 #define IDC_STATUS_LABEL 1002
-#define IDC_STATS_LABEL  1003
-#define ID_STATS_TIMER   1
 
 #define WM_APP_TOGGLE    (WM_APP + 1)
 
+/* Layout: every child is at x=MARGIN with width=WINDOW_W-2*MARGIN so the
+ * left and right gutters are identical. */
 #define WINDOW_W 420
-#define WINDOW_H 260
+#define WINDOW_H 230
+#define MARGIN   20
 
 /* Keyboard hook state -- fires the toggle the instant Left Alt goes
  * down. Auto-repeat is suppressed so holding the key doesn't re-fire.
@@ -130,26 +126,17 @@ static DWORD WINAPI divert_thread(LPVOID unused)
             continue;
         }
 
-        UINT n_addrs = addr_len / sizeof(WINDIVERT_ADDRESS);
-
         /* The critical read: one atomic load per batch decides how the
          * whole batch is handled. No locks, no contention. */
         LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
 
-        if (hold) {
-            /* HOLD during a refresh so the connection settles. */
-            InterlockedExchangeAdd64(&g_packets_held, (LONG64)n_addrs);
-        } else {
+        if (!hold) {
             /* Forward the whole batch untouched. */
             WinDivertSendEx(g_divert, packets, recv_len, NULL, 0,
                 addrs, addr_len, NULL);
-            InterlockedExchangeAdd64(&g_packets_forwarded, (LONG64)n_addrs);
         }
-
-        /* We do NOT post per-batch UI updates from this hot path --
-         * the UI thread pulls counters off a 200ms timer instead. Keeping
-         * the worker lean means the refresh kicks in instantly even under
-         * heavy outbound traffic. */
+        /* else: drop the batch on the floor. Packets already left the
+         * stack, so "do nothing" means the refresh is in effect. */
     }
 
     free(packets);
@@ -164,24 +151,12 @@ static void update_status_ui(void)
     LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
 
     if (hold) {
-        SetWindowTextA(g_toggle_btn,
-            "REFRESHING\n(click or press Left Alt to resume)");
-        SetWindowTextA(g_status_label,
-            "CONNECTION: REFRESHING");
+        SetWindowTextA(g_toggle_btn,   "REFRESHING");
+        SetWindowTextA(g_status_label, "CONNECTION: REFRESHING");
     } else {
-        SetWindowTextA(g_toggle_btn,
-            "CONNECTED\n(click or press Left Alt to refresh)");
-        SetWindowTextA(g_status_label,
-            "CONNECTION: ACTIVE");
+        SetWindowTextA(g_toggle_btn,   "CONNECTED");
+        SetWindowTextA(g_status_label, "CONNECTION: ACTIVE");
     }
-
-    LONG64 forwarded = InterlockedCompareExchange64(&g_packets_forwarded, 0, 0);
-    LONG64 held      = InterlockedCompareExchange64(&g_packets_held,      0, 0);
-    char buf[128];
-    ES_SNPRINTF(buf, sizeof(buf),
-        "forwarded: %lld   buffered: %lld",
-        (long long)forwarded, (long long)held);
-    SetWindowTextA(g_stats_label, buf);
 
     InvalidateRect(g_main_wnd, NULL, FALSE);
 }
@@ -276,33 +251,27 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
-        g_big_font   = make_font(-28, FW_BOLD);
+        const int content_w = WINDOW_W - 2 * MARGIN; /* symmetric gutters */
+
+        g_big_font   = make_font(-32, FW_BOLD);
         g_small_font = make_font(-14, FW_NORMAL);
 
-        g_toggle_btn = CreateWindowA("BUTTON",
-            "CONNECTED\n(click or press Left Alt to refresh)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_MULTILINE,
-            20, 20, WINDOW_W - 60, 130,
+        g_toggle_btn = CreateWindowA("BUTTON", "CONNECTED",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            MARGIN, 20, content_w, 130,
             hwnd, (HMENU)(INT_PTR)IDC_TOGGLE_BTN, GetModuleHandle(NULL), NULL);
         SendMessage(g_toggle_btn, WM_SETFONT, (WPARAM)g_big_font, TRUE);
 
         g_status_label = CreateWindowA("STATIC", "CONNECTION: ACTIVE",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            20, 160, WINDOW_W - 60, 24,
+            MARGIN, 160, content_w, 24,
             hwnd, (HMENU)(INT_PTR)IDC_STATUS_LABEL, GetModuleHandle(NULL), NULL);
         SendMessage(g_status_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
-
-        g_stats_label = CreateWindowA("STATIC",
-            "forwarded: 0   buffered: 0",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            20, 188, WINDOW_W - 60, 20,
-            hwnd, (HMENU)(INT_PTR)IDC_STATS_LABEL, GetModuleHandle(NULL), NULL);
-        SendMessage(g_stats_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
         HWND hint = CreateWindowA("STATIC",
             "Global shortcut: Left Alt  |  Runs as Administrator",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            20, 212, WINDOW_W - 60, 20,
+            MARGIN, 188, content_w, 20,
             hwnd, NULL, GetModuleHandle(NULL), NULL);
         SendMessage(hint, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
@@ -315,10 +284,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_hook_thread != NULL) {
             SetThreadPriority(g_hook_thread, THREAD_PRIORITY_TIME_CRITICAL);
         }
-
-        /* Refresh the counters label at a modest cadence -- the worker
-         * thread is decoupled from the UI so it never blocks. */
-        SetTimer(hwnd, ID_STATS_TIMER, 200, NULL);
         return 0;
     }
 
@@ -348,18 +313,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         update_status_ui();
         return 0;
 
-    case WM_TIMER:
-        if (wp == ID_STATS_TIMER) {
-            update_status_ui();
-        }
-        return 0;
-
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
-        KillTimer(hwnd, ID_STATS_TIMER);
         if (g_hook_thread != NULL) {
             /* Tell the hook thread to exit its message loop; it will
              * unhook on the way out. */
