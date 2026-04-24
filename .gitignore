@@ -1,0 +1,16 @@
+build/
+third_party/
+*.obj
+*.res
+*.res.o
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.exe
+*.dll
+*.sys
+
+# Pre-built, ready-to-run bundles are tracked intentionally.
+!release/
+!release/**
