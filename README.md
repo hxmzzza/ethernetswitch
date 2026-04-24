@@ -6,8 +6,8 @@ drain stale state, then resumes it cleanly — useful when a long-lived
 connection has degraded and you want to reset the link without
 disabling the adapter or rebooting.
 
-> Click the big button — or **tap Left Alt** from any application — to
-> pause outbound traffic. Do it again to resume.
+> Click the big button — or **press Left Alt** from any application —
+> to pause outbound traffic. Do it again to resume.
 
 ## Running the pre-built binary (no build required)
 
@@ -54,14 +54,18 @@ disable/enable. It's a live gate in front of the outbound packet queue.
 └──────────────┘                                  └────────────────────────┘
 ```
 
-### Why Left Alt tap (not a classic hotkey)
+### Why a low-level keyboard hook
 
 `RegisterHotKey()` won't bind a bare modifier, so we use a
-`WH_KEYBOARD_LL` low-level keyboard hook and listen for a *tap* of
-`VK_LMENU` — a press followed by a release with no other key chorded in
-between. That way normal Alt+Tab / Alt+F4 / menu-access shortcuts still
-work exactly as they always did; only a solo Left-Alt tap triggers the
-refresh.
+`WH_KEYBOARD_LL` low-level keyboard hook on a dedicated thread. The hook
+fires on the very first keydown edge of `VK_LMENU` (Left Alt),
+suppresses the OS-level auto-repeat stream that would otherwise re-fire
+the toggle, and swallows both the keydown and the keyup so the Alt key
+doesn't leak through and flash Windows' menu bar. The actual toggle is a
+single `InterlockedExchange` on the shared flag — the divert worker
+reads it on its next batch (it's blocked in `WinDivertRecvEx` waiting
+for the next outbound packet, which is exactly when the flag matters),
+so the effect is applied to the first packet after the keydown edge.
 
 ## Building from source
 
@@ -115,7 +119,7 @@ driver can't load without it.
 | Action                                  | Effect                               |
 | --------------------------------------- | ------------------------------------ |
 | Click the big button                    | Toggle refresh / resume              |
-| Tap **Left Alt** (from anywhere)        | Toggle refresh / resume              |
+| Press **Left Alt** (from anywhere)      | Toggle refresh / resume              |
 | Close the window                        | Restore normal forwarding, unload    |
 
 The status label shows whether the connection is **ACTIVE** (green) or

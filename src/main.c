@@ -67,13 +67,15 @@ static HFONT g_small_font   = NULL;
 #define WINDOW_W 420
 #define WINDOW_H 260
 
-/* Keyboard hook state -- detects a "tap" of LeftAlt: press, then release,
- * with no other key having been pressed in between. This avoids stealing
- * normal Alt+Tab / Alt+F4 / menu access while still giving the app a
- * global, modifier-only trigger from any foreground window. */
-static HHOOK  g_kbd_hook       = NULL;
-static BOOL   g_lalt_down      = FALSE;
-static BOOL   g_lalt_consumed  = FALSE; /* another key was chorded in */
+/* Keyboard hook state -- fires the toggle the instant Left Alt goes
+ * down. Auto-repeat is suppressed so holding the key doesn't re-fire.
+ * The hook lives on a dedicated thread with its own message loop, so
+ * the OS never starves us (if the UI thread ever blocks, Windows would
+ * silently drop a hook that was installed on it). */
+static HHOOK  g_kbd_hook   = NULL;
+static HANDLE g_hook_thread = NULL;
+static DWORD  g_hook_tid    = 0;
+static BOOL   g_lalt_down   = FALSE;
 
 /* ---------- divert worker ---------- */
 
@@ -163,12 +165,12 @@ static void update_status_ui(void)
 
     if (hold) {
         SetWindowTextA(g_toggle_btn,
-            "REFRESHING\n(click or tap Left Alt to resume)");
+            "REFRESHING\n(click or press Left Alt to resume)");
         SetWindowTextA(g_status_label,
             "CONNECTION: REFRESHING");
     } else {
         SetWindowTextA(g_toggle_btn,
-            "CONNECTED\n(click or tap Left Alt to refresh)");
+            "CONNECTED\n(click or press Left Alt to refresh)");
         SetWindowTextA(g_status_label,
             "CONNECTION: ACTIVE");
     }
@@ -198,15 +200,17 @@ static HFONT make_font(int height, int weight)
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
 }
 
-/* Low-level keyboard hook: fires a toggle when the user "taps" Left Alt
- * (presses then releases it) without pressing any other key in between.
- * This is the only reliable way to listen for a bare modifier globally --
- * RegisterHotKey() refuses to bind a modifier with no non-modifier key,
- * and WM_HOTKEY with VK_LMENU alone is not a legal combination.
+/* Low-level keyboard hook: fires a toggle the instant Left Alt is
+ * pressed. We both flip the shared flag directly (so the next outbound
+ * packet already sees the new state -- the divert worker is just a
+ * Sleep-like blocking recv on another thread, and it does not need to
+ * wake up for the toggle to take effect) AND post a message to the UI
+ * thread to refresh the label. The atomic write is what actually makes
+ * this feel instant; the PostMessage is just cosmetic.
  *
- * Runs on the thread that set the hook (our UI thread's message loop).
- * Must return quickly and MUST NOT call anything that could block, so the
- * actual toggle is deferred via PostMessage. */
+ * We also swallow the Alt keydown/keyup (return 1 instead of chaining)
+ * so Windows doesn't show the menu-bar focus flash that a bare Alt
+ * press would normally trigger on most apps. */
 static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wp, LPARAM lp)
 {
     if (nCode != HC_ACTION) {
@@ -216,30 +220,56 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wp, LPARAM lp)
     KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lp;
     BOOL is_lalt = (kb->vkCode == VK_LMENU);
 
-    if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
-        if (is_lalt) {
-            /* Ignore auto-repeat so holding Alt doesn't look like a tap. */
+    if (is_lalt) {
+        if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+            /* Suppress OS auto-repeat: only fire on the first-down edge. */
             if (!g_lalt_down) {
-                g_lalt_down     = TRUE;
-                g_lalt_consumed = FALSE;
+                g_lalt_down = TRUE;
+
+                /* ---- the actual hot path ----
+                 * One atomic flip. The divert worker reads this flag on
+                 * its next batch (typically microseconds away because it
+                 * is blocked in WinDivertRecvEx waiting for the very
+                 * next outbound packet). */
+                InterlockedExchange(&g_holding, !g_holding);
+
+                /* Nudge the UI thread to redraw. Not on the hot path. */
+                if (g_main_wnd != NULL) {
+                    PostMessage(g_main_wnd, WM_APP_TOGGLE, 0, 0);
+                }
             }
-        } else if (g_lalt_down) {
-            /* Any non-LAlt key while LAlt is held means this was a
-             * combination (Alt+Tab, Alt+F4, menu access), not a tap. */
-            g_lalt_consumed = TRUE;
-        }
-    } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
-        if (is_lalt && g_lalt_down) {
-            BOOL was_tap = !g_lalt_consumed;
-            g_lalt_down     = FALSE;
-            g_lalt_consumed = FALSE;
-            if (was_tap && g_main_wnd != NULL) {
-                PostMessage(g_main_wnd, WM_APP_TOGGLE, 0, 0);
-            }
+            return 1; /* swallow: no menu-bar flash, no Alt leaks through */
+        } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+            g_lalt_down = FALSE;
+            return 1; /* swallow the matching keyup too */
         }
     }
 
     return CallNextHookEx(g_kbd_hook, nCode, wp, lp);
+}
+
+/* Dedicated thread that hosts the low-level keyboard hook. It must pump
+ * its own message queue, otherwise the OS will never deliver hook
+ * callbacks to it (LL hooks are delivered as synthetic messages to the
+ * installing thread). */
+static DWORD WINAPI hook_thread_proc(LPVOID unused)
+{
+    (void)unused;
+    g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, low_level_kbd_proc,
+        GetModuleHandleA(NULL), 0);
+    if (g_kbd_hook == NULL) {
+        return 1;
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnhookWindowsHookEx(g_kbd_hook);
+    g_kbd_hook = NULL;
+    return 0;
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -250,7 +280,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_small_font = make_font(-14, FW_NORMAL);
 
         g_toggle_btn = CreateWindowA("BUTTON",
-            "CONNECTED\n(click or tap Left Alt to refresh)",
+            "CONNECTED\n(click or press Left Alt to refresh)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_MULTILINE,
             20, 20, WINDOW_W - 60, 130,
             hwnd, (HMENU)(INT_PTR)IDC_TOGGLE_BTN, GetModuleHandle(NULL), NULL);
@@ -270,16 +300,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessage(g_stats_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
         HWND hint = CreateWindowA("STATIC",
-            "Global shortcut: tap Left Alt  |  Runs as Administrator",
+            "Global shortcut: Left Alt  |  Runs as Administrator",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 212, WINDOW_W - 60, 20,
             hwnd, NULL, GetModuleHandle(NULL), NULL);
         SendMessage(hint, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
-        /* Install a global low-level keyboard hook so a Left Alt tap
-         * triggers a refresh from any foreground app. */
-        g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, low_level_kbd_proc,
-            GetModuleHandleA(NULL), 0);
+        /* Install a global low-level keyboard hook on a dedicated
+         * thread, so a Left Alt press triggers a refresh from any
+         * foreground app the instant it's pressed. Its own message
+         * loop keeps it from ever being starved by UI work. */
+        g_hook_thread = CreateThread(NULL, 0, hook_thread_proc, NULL, 0,
+            &g_hook_tid);
+        if (g_hook_thread != NULL) {
+            SetThreadPriority(g_hook_thread, THREAD_PRIORITY_TIME_CRITICAL);
+        }
 
         /* Refresh the counters label at a modest cadence -- the worker
          * thread is decoupled from the UI so it never blocks. */
@@ -308,7 +343,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_APP_TOGGLE:
-        toggle_refresh();
+        /* The keyboard hook has already flipped g_holding atomically --
+         * all we need to do here is repaint the labels. */
+        update_status_ui();
         return 0;
 
     case WM_TIMER:
@@ -323,9 +360,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, ID_STATS_TIMER);
-        if (g_kbd_hook != NULL) {
-            UnhookWindowsHookEx(g_kbd_hook);
-            g_kbd_hook = NULL;
+        if (g_hook_thread != NULL) {
+            /* Tell the hook thread to exit its message loop; it will
+             * unhook on the way out. */
+            PostThreadMessage(g_hook_tid, WM_QUIT, 0, 0);
+            WaitForSingleObject(g_hook_thread, 1000);
+            CloseHandle(g_hook_thread);
+            g_hook_thread = NULL;
         }
         PostQuitMessage(0);
         return 0;

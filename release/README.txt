@@ -25,17 +25,14 @@ If it says "64-bit operating system", use  x64\ .
 Using the refresher
 -------------------
 
-  - Click the big button -----------> start / stop a refresh
-  - Tap LEFT ALT from any app ------> start / stop a refresh (global)
+  - Click the big button ---------------> start / stop a refresh
+  - Press LEFT ALT from any app --------> start / stop a refresh (global)
 
-The global shortcut is a *tap* of Left Alt (press and release with no
-other key in between), so normal Alt+Tab, Alt+F4, and menu shortcuts
-keep working.
-
-While "REFRESHING", outbound traffic is paused so the network stack can
-settle. Tap Left Alt (or click the button) again to resume -- traffic
-is forwarded again immediately. Closing the window always returns the
-connection to normal.
+The global shortcut fires the instant Left Alt goes down, from any
+foreground window. While "REFRESHING", outbound traffic is paused so
+the network stack can settle. Press Left Alt (or click the button)
+again to resume -- traffic is forwarded again immediately. Closing the
+window always returns the connection to normal.
 
 What's in each folder
 ---------------------
