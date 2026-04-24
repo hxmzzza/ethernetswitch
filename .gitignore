@@ -10,3 +10,7 @@ third_party/
 *.exe
 *.dll
 *.sys
+
+# Pre-built, ready-to-run bundles are tracked intentionally.
+!release/
+!release/**

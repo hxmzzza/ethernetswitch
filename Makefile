@@ -12,14 +12,15 @@
 ARCH ?= x64
 
 ifeq ($(ARCH),x64)
-  CC      ?= x86_64-w64-mingw32-gcc
-  WINDRES ?= x86_64-w64-mingw32-windres
-  SYS     := WinDivert64.sys
+  TOOLCHAIN_PREFIX ?= x86_64-w64-mingw32-
+  SYS              := WinDivert64.sys
 else
-  CC      ?= i686-w64-mingw32-gcc
-  WINDRES ?= i686-w64-mingw32-windres
-  SYS     := WinDivert32.sys
+  TOOLCHAIN_PREFIX ?= i686-w64-mingw32-
+  SYS              := WinDivert32.sys
 endif
+
+CC      := $(TOOLCHAIN_PREFIX)gcc
+WINDRES := $(TOOLCHAIN_PREFIX)windres
 
 ROOT    := $(CURDIR)
 OUT     := $(ROOT)/build

@@ -49,7 +49,19 @@ up/down bounce, no adapter disable. Just a live packet gate.
 └──────────────┘                                  └────────────────────┘
 ```
 
-## Building
+## Running the pre-built binary (no build required)
+
+A ready-to-run build is checked in under [`release/`](./release/). On Windows:
+
+1. Download the repo (or just the `release/` folder).
+2. Double-click `release/run.bat` — it picks the right architecture
+   automatically — or drill in to `release/x64/ethernetswitch.exe`
+   (use `x86` on 32-bit Windows).
+3. Accept the UAC prompt. That's it.
+
+See [`release/README.txt`](./release/README.txt) for details.
+
+## Building from source
 
 ### Prerequisites
 

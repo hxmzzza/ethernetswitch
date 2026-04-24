@@ -16,13 +16,14 @@
 #>
 
 param(
-    [string]$Version = "2.2.2-A",
+    [string]$Version = "2.2.2",
+    [string]$Variant = "A",
     [string]$OutDir  = (Join-Path $PSScriptRoot "..\third_party\windivert")
 )
 
 $ErrorActionPreference = "Stop"
 
-$zipName = "WinDivert-$Version.zip"
+$zipName = "WinDivert-$Version-$Variant.zip"
 $url     = "https://github.com/basil00/WinDivert/releases/download/v$Version/$zipName"
 
 $tmp    = Join-Path $env:TEMP "ethernetswitch_$Version"
