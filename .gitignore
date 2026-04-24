@@ -1,0 +1,12 @@
+build/
+third_party/
+*.obj
+*.res
+*.res.o
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.exe
+*.dll
+*.sys
