@@ -166,16 +166,16 @@ static HFONT make_font(int height, int weight)
 }
 
 /* Low-level keyboard hook: fires a toggle the instant Left Alt is
- * pressed. We both flip the shared flag directly (so the next outbound
- * packet already sees the new state -- the divert worker is just a
- * Sleep-like blocking recv on another thread, and it does not need to
- * wake up for the toggle to take effect) AND post a message to the UI
- * thread to refresh the label. The atomic write is what actually makes
- * this feel instant; the PostMessage is just cosmetic.
+ * pressed. The toggle itself -- a single InterlockedExchange -- happens
+ * inside this callback, so the divert worker (blocked in
+ * WinDivertRecvEx) sees the new state on the very next outbound packet.
  *
- * We also swallow the Alt keydown/keyup (return 1 instead of chaining)
- * so Windows doesn't show the menu-bar focus flash that a bare Alt
- * press would normally trigger on most apps. */
+ * We do NOT consume the Alt event: we chain via CallNextHookEx so the
+ * OS still processes Alt normally. That means Alt+Tab, Alt+F4, menu
+ * access, etc. continue to work as they always did. The trade-off is
+ * that each toggling Alt press also does its usual OS-level thing
+ * (e.g. a quick menu-bar focus flash on the foreground window); the
+ * user has accepted this. */
 static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wp, LPARAM lp)
 {
     if (nCode != HC_ACTION) {
@@ -203,13 +203,12 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wp, LPARAM lp)
                     PostMessage(g_main_wnd, WM_APP_TOGGLE, 0, 0);
                 }
             }
-            return 1; /* swallow: no menu-bar flash, no Alt leaks through */
         } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
             g_lalt_down = FALSE;
-            return 1; /* swallow the matching keyup too */
         }
     }
 
+    /* Always chain: let Windows handle Alt normally (Alt+Tab, menus, etc). */
     return CallNextHookEx(g_kbd_hook, nCode, wp, lp);
 }
 
