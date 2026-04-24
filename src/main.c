@@ -46,22 +46,20 @@ static HANDLE g_thread = NULL;
 static volatile LONG g_should_exit = 0;
 
 /* UI handles */
-static HWND g_main_wnd      = NULL;
-static HWND g_toggle_btn    = NULL;
-static HWND g_status_label  = NULL;
-static HFONT g_big_font     = NULL;
-static HFONT g_small_font   = NULL;
+static HWND g_main_wnd   = NULL;
+static HWND g_toggle_btn = NULL;
+static HFONT g_big_font  = NULL;
 
 #define IDC_TOGGLE_BTN   1001
-#define IDC_STATUS_LABEL 1002
 
 #define WM_APP_TOGGLE    (WM_APP + 1)
 
-/* Layout: every child is at x=MARGIN with width=WINDOW_W-2*MARGIN so the
- * left and right gutters are identical. */
-#define WINDOW_W 420
-#define WINDOW_H 230
-#define MARGIN   20
+/* Layout: the button is the only content in the window, centered with
+ * symmetric gutters on every side. */
+#define WINDOW_W  420
+#define MARGIN    20
+#define BUTTON_H  130
+#define WINDOW_H  (BUTTON_H + 2 * MARGIN)
 
 /* Keyboard hook state -- fires the toggle the instant Left Alt goes
  * down. Auto-repeat is suppressed so holding the key doesn't re-fire.
@@ -149,15 +147,7 @@ static DWORD WINAPI divert_thread(LPVOID unused)
 static void update_status_ui(void)
 {
     LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
-
-    if (hold) {
-        SetWindowTextA(g_toggle_btn,   "REFRESHING");
-        SetWindowTextA(g_status_label, "CONNECTION: REFRESHING");
-    } else {
-        SetWindowTextA(g_toggle_btn,   "CONNECTED");
-        SetWindowTextA(g_status_label, "CONNECTION: ACTIVE");
-    }
-
+    SetWindowTextA(g_toggle_btn, hold ? "REFRESHING" : "CONNECTED");
     InvalidateRect(g_main_wnd, NULL, FALSE);
 }
 
@@ -251,29 +241,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
-        const int content_w = WINDOW_W - 2 * MARGIN; /* symmetric gutters */
+        const int content_w = WINDOW_W - 2 * MARGIN;
 
-        g_big_font   = make_font(-32, FW_BOLD);
-        g_small_font = make_font(-14, FW_NORMAL);
+        g_big_font = make_font(-32, FW_BOLD);
 
         g_toggle_btn = CreateWindowA("BUTTON", "CONNECTED",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            MARGIN, 20, content_w, 130,
+            MARGIN, MARGIN, content_w, BUTTON_H,
             hwnd, (HMENU)(INT_PTR)IDC_TOGGLE_BTN, GetModuleHandle(NULL), NULL);
         SendMessage(g_toggle_btn, WM_SETFONT, (WPARAM)g_big_font, TRUE);
-
-        g_status_label = CreateWindowA("STATIC", "CONNECTION: ACTIVE",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            MARGIN, 160, content_w, 24,
-            hwnd, (HMENU)(INT_PTR)IDC_STATUS_LABEL, GetModuleHandle(NULL), NULL);
-        SendMessage(g_status_label, WM_SETFONT, (WPARAM)g_small_font, TRUE);
-
-        HWND hint = CreateWindowA("STATIC",
-            "Global shortcut: Left Alt  |  Runs as Administrator",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            MARGIN, 188, content_w, 20,
-            hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessage(hint, WM_SETFONT, (WPARAM)g_small_font, TRUE);
 
         /* Install a global low-level keyboard hook on a dedicated
          * thread, so a Left Alt press triggers a refresh from any
@@ -285,20 +261,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetThreadPriority(g_hook_thread, THREAD_PRIORITY_TIME_CRITICAL);
         }
         return 0;
-    }
-
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        HWND ctl = (HWND)lp;
-        LONG hold = InterlockedCompareExchange(&g_holding, 0, 0);
-        if (ctl == g_status_label) {
-            /* Amber while refreshing, green while actively connected. */
-            SetTextColor(dc, hold ? RGB(200, 130, 20) : RGB(30, 140, 60));
-            SetBkMode(dc, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-        }
-        SetBkMode(dc, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
 
     case WM_COMMAND:
@@ -431,8 +393,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
     }
     WinDivertClose(g_divert);
 
-    if (g_big_font)   DeleteObject(g_big_font);
-    if (g_small_font) DeleteObject(g_small_font);
+    if (g_big_font) DeleteObject(g_big_font);
 
     return (int)msg.wParam;
 }
